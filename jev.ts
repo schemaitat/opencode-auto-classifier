@@ -1,12 +1,16 @@
-// TypeSafe Jev ("System One") client for the OpenCode Zen endpoint.
+// TypeSafe Jev ("System One") client.
 //
 // Jev is a decision model: you send it a `state` (unstructured text, here a
 // shell command) plus typed `questions`, and it returns typed answers with
 // calibrated probabilities rather than generated text. It is not an LLM and it
 // does not stream.
 //
-// Verified against https://opencode.ai/zen/v1/systemone on 2026-10-11:
-//   jev-1.13       -> requires Authorization: Bearer <inference-scoped key>
+// The same request/response shape is served by two endpoints, selected by the
+// plugin's `provider` option:
+//   jev        -> https://opencode.ai/zen/v1/systemone (OpenCode Zen)
+//                 verified 2026-10-11 with jev-1.13; needs an inference-scoped key
+//   openrouter -> https://openrouter.ai/api/alpha/decisions (OpenRouter Decisions)
+//                 verified 2026-10-15 with typesafe/jev-1.14; needs an OpenRouter key
 // There is deliberately no free-model default: calls are either the paid Jev
 // model (with a key) or, when that fails, the plugin's LLM fallback.
 
@@ -18,8 +22,10 @@ export type JevOptions = {
   model?: string
   /** System One endpoint. Defaults to the OpenCode Zen route. */
   endpoint?: string
-  /** Bearer token. Falls back to OPENCODE_API_KEY, then anonymous. */
+  /** Bearer token. Falls back to the `apiKeyEnv` environment variable, then anonymous. */
   apiKey?: string
+  /** Environment variable read when no apiKey is given. Defaults to "OPENCODE_API_KEY". */
+  apiKeyEnv?: string
   /** Whole-request timeout in milliseconds. Defaults to 10000. */
   timeoutMs?: number
   /** Override fetch (used by tests). Defaults to globalThis.fetch. */
@@ -84,6 +90,11 @@ const RISK_LEVELS = [
   "Critical: destructive or irreversible (data loss, system damage)",
 ]
 
+// Jev answers a score question on the scale of its criteria indices
+// (0..RISK_LEVELS.length - 1), not 0..1. Dividing by the top index gives the
+// 0..1 risk the decision thresholds expect.
+const TOP_RISK_LEVEL = RISK_LEVELS.length - 1
+
 function buildQuestions() {
   return {
     category: {
@@ -110,6 +121,14 @@ function buildQuestions() {
   }
 }
 
+/** Read one numeric answer; throws when it is missing or not a number. */
+function numeric(value: unknown, name: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`jev: answer has no numeric ${name}: ${JSON.stringify(value) ?? "undefined"}`)
+  }
+  return value
+}
+
 function clamp01(n: unknown): number {
   const v = typeof n === "number" ? n : Number(n)
   if (!Number.isFinite(v)) return 0
@@ -126,7 +145,7 @@ type FetchLike = typeof fetch
 export function createClassifier(options: JevOptions = {}) {
   const model = options.model ?? DEFAULT_MODEL
   const endpoint = options.endpoint ?? DEFAULT_ENDPOINT
-  const apiKey = options.apiKey ?? process.env.OPENCODE_API_KEY ?? undefined
+  const apiKey = options.apiKey ?? process.env[options.apiKeyEnv ?? "OPENCODE_API_KEY"] ?? undefined
   const timeoutMs = options.timeoutMs ?? 10_000
   const doFetch: FetchLike = options.fetch ?? fetch
 
@@ -171,19 +190,23 @@ export function createClassifier(options: JevOptions = {}) {
         throw new Error(`jev: unexpected response shape: ${text.slice(0, 200)}`)
       }
 
+      // Missing scores throw rather than defaulting to 0, the safe end of
+      // every scale, so a partial answer fails over instead of allowing.
+      const risk = clamp01(numeric(answers.risk.score, "risk") / TOP_RISK_LEVEL)
+      const destructive = clamp01(numeric(answers.destructive?.noul, "destructive"))
+      const secretExposure = clamp01(numeric(answers.secret_exposure?.noul, "secret_exposure"))
       const riskLegend =
-        answers.risk.legend?.[String(Math.round(clamp01(answers.risk.score) * 4))] ??
-        answers.risk.legend?.["0"]
+        answers.risk.legend?.[String(Math.round(risk * TOP_RISK_LEVEL))] ?? answers.risk.legend?.["0"]
 
       return {
         command: state,
         model: body.model ?? model,
         category: answers.category.choice,
         categoryConfidence: clamp01(answers.category.confidence),
-        risk: clamp01(answers.risk.score),
+        risk,
         riskLegend,
-        destructive: clamp01(answers.destructive?.noul),
-        secretExposure: clamp01(answers.secret_exposure?.noul),
+        destructive,
+        secretExposure,
         answers,
         usage: body.usage,
       }

@@ -2,7 +2,9 @@
 
 An OpenCode plugin that wraps every shell command, file read, and file edit in a
 classifier powered by [TypeSafe Jev](https://typesafe.ai) ("System One"), served
-through OpenCode Zen.
+through OpenCode Zen or, with `"provider": "openrouter"`, through
+[OpenRouter](https://openrouter.ai)'s Decisions API. Both serve the same model
+API, so the plugin behaves the same either way.
 
 Before a shell command runs — or a file is read or edited — the plugin sends the
 resource to Jev, which answers typed questions about it:
@@ -58,9 +60,11 @@ paths work too, which is handy for local development:
 
 ### Requirements
 
-- A paid Jev (System One) inference key, or the LLM fallback (see
-  [Configuration](#configuration)). Without a key the plugin fails open by
-  default.
+- A paid Jev (System One) key for the selected provider, or the LLM fallback
+  (see [Configuration](#configuration)): an inference-scoped OpenCode Console
+  key in `OPENCODE_API_KEY` (default `jev` provider), or an OpenRouter key in
+  `OPENROUTER_API_KEY` (`openrouter` provider). Without a key the plugin fails
+  open by default.
 - The TUI sidebar half imports OpenCode's bundled OpenTUI/`solid-js` host
   modules through their runtime ids (`opentui:runtime-module:*`), so it works
   from a `node_modules` install without shipping its own copies. It is optional;
@@ -101,6 +105,7 @@ Other actions are ignored.
 
 - `index.ts` — server plugin: permission hook + `jev_classify_command` tool.
 - `jev.ts` — Jev client (System One request/response, timeouts, abort).
+- `verdict.ts` — LLM fallback prompt and verdict parser, unit-tested.
 - `decide.ts` — pure decision logic (thresholds, escalation, `describe`), unit-tested.
 - `format.ts` — pure sidebar formatting helpers, unit-tested.
 - `rpc.ts` — RPC shared with the TUI plugin (`recent` method, `classified` event).
@@ -158,9 +163,10 @@ passed through the object form:
 
 | Option             | Default          | Effect                                                        |
 | ------------------ | ---------------- | ------------------------------------------------------------- |
-| `model`            | `jev-1.13`       | paid Jev model (needs an inference-scoped key)                |
-| `endpoint`         | Zen System One   | `https://opencode.ai/zen/v1/systemone`                        |
-| `apiKey`           | `OPENCODE_API_KEY` | inference-scoped Console key (`oc_sk_...`)                  |
+| `provider`         | `jev`            | where Jev is served: `jev` (OpenCode Zen) or `openrouter`     |
+| `model`            | per provider     | `jev-1.13` (jev) / `typesafe/jev-1.14` (openrouter)           |
+| `endpoint`         | per provider     | Zen System One / OpenRouter Decisions (`/api/alpha/decisions`) |
+| `apiKey`           | per provider     | `OPENCODE_API_KEY` (`oc_sk_...`) / `OPENROUTER_API_KEY`       |
 | `timeoutMs`        | `10000`          | Whole-request timeout                                         |
 | `askRisk`          | `0.7`            | risk >= this -> escalate (`shell` only)                       |
 | `askDestructive`   | `0.4`            | destructive >= this -> escalate                               |
@@ -229,6 +235,12 @@ jev_classify_command({ "command": "rm -rf ./build" })
   as `apiKey` or `OPENCODE_API_KEY`. A key without model permission returns
   `403 "This API key can't call models"`, and the Console OAuth token is
   rejected by the zen endpoint (`401 "Invalid API key."`).
+- With `"provider": "openrouter"`, Jev is called through OpenRouter's Decisions
+  API (`https://openrouter.ai/api/alpha/decisions`) with the same typed
+  questions, using an OpenRouter key from `apiKey` or `OPENROUTER_API_KEY`. Each
+  provider reads only its own key. The Decisions API is an **alpha** endpoint,
+  so its path or shape may change. Set `"model": "~typesafe/jev-latest"` to
+  follow new Jev releases instead of pinning one.
 - The DeepSeek fallback is a normal LLM call, so it is slower and consumes the
   fallback model's quota; it only runs after a Jev failure.
 
@@ -236,7 +248,8 @@ jev_classify_command({ "command": "rm -rf ./build" })
 
 The pure logic is split out so it can be tested without the OpenCode runtime:
 `decide.ts` (thresholds and escalation rules), `format.ts` (sidebar rendering),
-and `jev.ts` (the System One client, tested with an injected `fetch`).
+`jev.ts` (the System One client, tested with an injected `fetch`), and
+`verdict.ts` (the fallback prompt and parser).
 
 ```sh
 npm test          # node --test, no dependencies
@@ -254,5 +267,9 @@ paid Jev (System One)  --429/timeout/error-->  ctx.generate.text(fallbackModel)
 
 The fallback prompt asks for strict JSON
 (`{"category":…,"risk":0..1,"destructive":0..1,"secret_exposure":0..1}`), which
-is parsed and fed through the same `decide()` rules. The resulting decision is
+is parsed and fed through the same `decide()` rules. A verdict with a missing
+or non-numeric score counts as a failure, leaving the decision to `failMode`,
+rather than as a score of 0. The action is sent JSON-encoded and marked as
+untrusted data, so text inside a command cannot pose as classifier
+instructions. The resulting decision is
 tagged `via=fallback` so it is visible in debug logs and permission messages.

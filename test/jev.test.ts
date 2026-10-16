@@ -24,7 +24,8 @@ const ANSWER_BODY = {
   usage: { total_tokens: 12 },
   answers: {
     category: { choice: "vcs", confidence: 0.93, probabilities: { vcs: 0.93, other: 0.07 } },
-    risk: { score: 0.91, confidence: 0.8, legend: { "0": "Safe", "4": "Critical" } },
+    // Score is on the 0..4 risk-level scale; 3.64 / 4 = 0.91.
+    risk: { score: 3.64, confidence: 0.8, legend: { "0": "Safe", "4": "Critical" } },
     destructive: { noul: 0.92 },
     secret_exposure: { noul: 0.23 },
   },
@@ -106,14 +107,26 @@ test("parses a well-formed response into a Classification", async () => {
 
 test("maps the risk score onto the legend band", async () => {
   const c = classifierReturning(ANSWER_BODY)
-  // 0.91 * 4 rounds to 4 -> "Critical".
+  // Level 3.64 rounds to 4 -> "Critical".
   assert.equal((await c.cls.classify("x")).riskLegend, "Critical")
 
   const low = classifierReturning({
     ...ANSWER_BODY,
-    answers: { ...ANSWER_BODY.answers, risk: { score: 0.1, legend: { "0": "Safe", "4": "Critical" } } },
+    answers: { ...ANSWER_BODY.answers, risk: { score: 0.4, legend: { "0": "Safe", "4": "Critical" } } },
   })
   assert.equal((await low.cls.classify("x")).riskLegend, "Safe")
+})
+
+test("normalizes the risk level to 0..1 rather than clamping it", async () => {
+  // Jev 1.14 answered 1.84 ("Moderate") for a source-file edit; clamping read
+  // that as maximum risk.
+  const c = classifierReturning({
+    ...ANSWER_BODY,
+    answers: { ...ANSWER_BODY.answers, risk: { score: 1.84, legend: { "0": "Safe", "2": "Moderate", "4": "Critical" } } },
+  })
+  const result = await c.cls.classify("x")
+  assert.equal(result.risk, 0.46)
+  assert.equal(result.riskLegend, "Moderate")
 })
 
 test("clamps out-of-range scores", async () => {
@@ -178,4 +191,48 @@ test("exposes the resolved model and endpoint", () => {
   const cls = createClassifier({ model: "custom", endpoint: "https://example.test" })
   assert.equal(cls.model, "custom")
   assert.equal(cls.endpoint, "https://example.test")
+})
+
+test("throws when a score is missing instead of treating it as safe", async () => {
+  const cases: Array<[string, Record<string, unknown>]> = [
+    ["risk", { risk: { confidence: 0.8 } }],
+    ["destructive", { destructive: undefined }],
+    ["destructive", { destructive: {} }],
+    ["secret_exposure", { secret_exposure: undefined }],
+    ["secret_exposure", { secret_exposure: { noul: "0.1" } }],
+  ]
+  for (const [name, override] of cases) {
+    const c = classifierReturning({ ...ANSWER_BODY, answers: { ...ANSWER_BODY.answers, ...override } })
+    await assert.rejects(() => c.cls.classify("ls"), new RegExp(`jev: answer has no numeric ${name}`))
+  }
+})
+
+test("reads the key from apiKeyEnv and never sends another provider's key", async () => {
+  const previous = { OPENCODE_API_KEY: process.env.OPENCODE_API_KEY, OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY }
+  // createClassifier reads the environment when it is built, so set it first.
+  const authorizationWith = async (routerKey: string | undefined) => {
+    if (routerKey === undefined) delete process.env.OPENROUTER_API_KEY
+    else process.env.OPENROUTER_API_KEY = routerKey
+    let headers: Record<string, string> = {}
+    const cls = createClassifier({
+      apiKeyEnv: "OPENROUTER_API_KEY",
+      fetch: (async (_url: any, options: any) => {
+        headers = options.headers
+        return new Response(JSON.stringify(ANSWER_BODY), { status: 200 })
+      }) as unknown as typeof fetch,
+    })
+    await cls.classify("ls")
+    return headers.Authorization
+  }
+
+  process.env.OPENCODE_API_KEY = "zen-key"
+  try {
+    assert.equal(await authorizationWith("router-key"), "Bearer router-key")
+    assert.equal(await authorizationWith(undefined), undefined)
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  }
 })
